@@ -42,9 +42,10 @@ class PrimaryEntryAdapter:
         )()
 
         plan = self.engine.build_trade_plan(
-            signal,
+            payload["direction"],
             take_profit
         )
+
 
         if not plan or not plan.valid:
             self.state.unlock()

@@ -1,48 +1,53 @@
-from dataclasses import dataclass
-
-
-@dataclass
 class TradePlan:
-    valid: bool
-    direction: str
-    entry_price: float
-    stop_loss: float
+    def __init__(self, direction, entry_price, stop_loss, take_profit):
+        self.direction = direction
+        self.entry_price = entry_price
+        self.stop_loss = stop_loss
+        self.take_profit = take_profit
+        self.valid = True
 
 
 class EntryEngine:
-    """
-    Converts structure confirmation into a limit entry plan.
-    """
-
-    def __init__(self, symbol: str):
+    def __init__(self, symbol):
         self.symbol = symbol
 
-    def build_trade_plan(self, structure_payload: dict, take_profit: float) -> TradePlan:
+    def build_trade_plan(self, direction: str, take_profit: float):
         """
-        Uses last break for entry logic.
-        This mirrors the behavior of the original bot, minus PDH/PDL coupling.
+        Build entry + SL from M5 structure direction.
+        TP is provided externally (liquidity-based).
         """
-        direction = structure_payload["direction"]
-        breaks = structure_payload["breaks"]
 
-        if not breaks:
-            return TradePlan(False, direction, 0.0, 0.0)
+        # -----------------------------
+        # Get latest M5 structure prices
+        # -----------------------------
+        import MetaTrader5 as mt5
+        import pandas as pd
 
-        last_break = breaks[-1]
+        m5 = pd.DataFrame(
+            mt5.copy_rates_from_pos(self.symbol, mt5.TIMEFRAME_M5, 0, 50)
+        )
 
-        if direction == "SELL":
-            entry = last_break
-            sl = max(breaks)
-        else:  # BUY
-            entry = last_break
-            sl = min(breaks)
+        if m5.empty or len(m5) < 3:
+            return None
+
+        last = m5.iloc[-1]
+
+        # -----------------------------
+        # Entry / SL logic (unchanged)
+        # -----------------------------
+        if direction == "BUY":
+            entry = last["low"]
+            sl = min(m5.iloc[-3]["low"], m5.iloc[-2]["low"])
+        else:
+            entry = last["high"]
+            sl = max(m5.iloc[-3]["high"], m5.iloc[-2]["high"])
 
         if entry == sl:
-            return TradePlan(False, direction, entry, sl)
+            return None
 
         return TradePlan(
-            valid=True,
             direction=direction,
-            entry_price=entry,
-            stop_loss=sl,
+            entry_price=float(entry),
+            stop_loss=float(sl),
+            take_profit=float(take_profit),
         )

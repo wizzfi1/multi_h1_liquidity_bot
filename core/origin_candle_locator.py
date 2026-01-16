@@ -1,64 +1,77 @@
 from dataclasses import dataclass
-from typing import Optional
-import pandas as pd
+from datetime import datetime
+from enum import Enum
+
+from core.liquidity_event_state import CleanupConfirmed, OriginConfirmed
+
+
+class Direction(Enum):
+    BUY = "BUY"
+    SELL = "SELL"
 
 
 @dataclass
-class OriginCandle:
-    time: pd.Timestamp
-    open: float
-    high: float
-    low: float
-    close: float
-    index: int
+class OriginContext:
+    origin_direction: Direction
+    cleanup_time: datetime
+    origin_candle: dict | None = None
 
 
-class OriginCandleLocator:
+class OriginLocator:
     """
-    Finds the origin candle:
-    → the first candle of the impulse leg
-    that caused the FIRST cleanup break.
+    Locates exactly ONE origin candle AFTER cleanup.
     """
 
-    def locate(
-        self,
-        m5_df: pd.DataFrame,
-        break_index: int,
-        direction: str,
-    ) -> Optional[OriginCandle]:
+    def __init__(self):
+        self.context: OriginContext | None = None
 
-        if break_index <= 0:
-            return None
+    # ─────────────────────────────────────────────
+    # EVENT: Cleanup confirmed
+    # ─────────────────────────────────────────────
+    def on_cleanup_confirmed(self, event: CleanupConfirmed):
+        if self.context is not None:
+            return
 
-        # We walk backward from the break candle
-        # until we find the candle that STARTED the impulse
-        i = break_index - 1
+        origin_direction = (
+            Direction.BUY if event.failure_direction == Direction.SELL
+            else Direction.SELL
+        )
 
-        while i > 0:
-            curr = m5_df.iloc[i]
-            prev = m5_df.iloc[i - 1]
+        self.context = OriginContext(
+            origin_direction=origin_direction,
+            cleanup_time=event.cleanup_time
+        )
 
-            if direction == "SELL":
-                # Impulse down started when a candle makes
-                # a lower low than previous
-                if curr["low"] < prev["low"]:
-                    i -= 1
-                    continue
-                break
+    # ─────────────────────────────────────────────
+    # EVENT: Candle closed
+    # ─────────────────────────────────────────────
+    def on_candle_closed(self, candle):
+        if not self._armed():
+            return
 
-            else:  # BUY
-                if curr["high"] > prev["high"]:
-                    i -= 1
-                    continue
-                break
+        if candle["time"] <= self.context.cleanup_time:
+            return
 
-        c = m5_df.iloc[i]
+        if self._is_valid_origin(candle):
+            self.context.origin_candle = candle
+            self._emit_origin(candle)
+            self.context = None  # 🔒 LOCK
 
-        return OriginCandle(
-            time=c["time"],
-            open=float(c["open"]),
-            high=float(c["high"]),
-            low=float(c["low"]),
-            close=float(c["close"]),
-            index=i,
+    # ─────────────────────────────────────────────
+    # Rules
+    # ─────────────────────────────────────────────
+    def _is_valid_origin(self, candle):
+        if self.context.origin_direction == Direction.BUY:
+            return candle["close"] > candle["open"]
+        else:
+            return candle["close"] < candle["open"]
+
+    def _armed(self):
+        return self.context is not None and self.context.origin_candle is None
+
+    def _emit_origin(self, candle):
+        OriginConfirmed.emit(
+            direction=self.context.origin_direction.value,
+            candle=candle,
+            cleanup_time=self.context.cleanup_time
         )

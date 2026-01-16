@@ -1,53 +1,102 @@
-class TradePlan:
-    def __init__(self, direction, entry_price, stop_loss, take_profit):
-        self.direction = direction
-        self.entry_price = entry_price
-        self.stop_loss = stop_loss
-        self.take_profit = take_profit
-        self.valid = True
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from enum import Enum
+
+from core.liquidity_event_state import OriginConfirmed, ProbeTriggered
+
+from core.liquidity_event_state import ProbeTriggered, LifecycleResolved
+
+
+class Direction(Enum):
+    BUY = "BUY"
+    SELL = "SELL"
+
+
+@dataclass
+class ProbeContext:
+    direction: Direction
+    origin_high: float
+    origin_low: float
+    origin_time: datetime
+    armed_time: datetime
+    triggered: bool = False
 
 
 class EntryEngine:
-    def __init__(self, symbol):
-        self.symbol = symbol
+    """
+    ProbeEngine.
+    Arms ONLY on OriginConfirmed.
+    Triggers exactly once.
+    """
 
-    def build_trade_plan(self, direction: str, take_profit: float):
-        """
-        Build entry + SL from M5 structure direction.
-        TP is provided externally (liquidity-based).
-        """
+    def __init__(self, timeout_minutes=120):
+        self.context: ProbeContext | None = None
+        self.timeout = timedelta(minutes=timeout_minutes)
 
-        # -----------------------------
-        # Get latest M5 structure prices
-        # -----------------------------
-        import MetaTrader5 as mt5
-        import pandas as pd
+    # ─────────────────────────────────────────────
+    # EVENT: Origin confirmed
+    # ─────────────────────────────────────────────
+    def on_origin_confirmed(self, event: OriginConfirmed):
+        if self.context is not None:
+            return  # 🔒 already armed
 
-        m5 = pd.DataFrame(
-            mt5.copy_rates_from_pos(self.symbol, mt5.TIMEFRAME_M5, 0, 50)
+        candle = event.candle
+
+        self.context = ProbeContext(
+            direction=Direction(event.direction),
+            origin_high=candle["high"],
+            origin_low=candle["low"],
+            origin_time=candle["time"],
+            armed_time=datetime.utcnow()
         )
 
-        if m5.empty or len(m5) < 3:
-            return None
+    # ─────────────────────────────────────────────
+    # EVENT: Candle closed (retrace only)
+    # ─────────────────────────────────────────────
+    def on_candle_closed(self, candle):
+        if not self._armed():
+            return
 
-        last = m5.iloc[-1]
+        # Timeout
+        if datetime.utcnow() - self.context.armed_time > self.timeout:
+            self._cancel("TIMEOUT")
+            return
 
-        # -----------------------------
-        # Entry / SL logic (unchanged)
-        # -----------------------------
-        if direction == "BUY":
-            entry = last["low"]
-            sl = min(m5.iloc[-3]["low"], m5.iloc[-2]["low"])
-        else:
-            entry = last["high"]
-            sl = max(m5.iloc[-3]["high"], m5.iloc[-2]["high"])
+        # Retrace into origin range
+        if self._inside_origin_range(candle):
+            self._trigger(candle)
 
-        if entry == sl:
-            return None
-
-        return TradePlan(
-            direction=direction,
-            entry_price=float(entry),
-            stop_loss=float(sl),
-            take_profit=float(take_profit),
+    # ─────────────────────────────────────────────
+    # Rules
+    # ─────────────────────────────────────────────
+    def _inside_origin_range(self, candle):
+        return (
+            candle["low"] <= self.context.origin_high
+            and candle["high"] >= self.context.origin_low
         )
+
+    def _armed(self):
+        return self.context is not None and not self.context.triggered
+
+    def _trigger(self, candle):
+        self.context.triggered = True
+
+        ProbeTriggered.emit(
+            direction=self.context.direction.value,
+            origin_high=self.context.origin_high,
+            origin_low=self.context.origin_low,
+            origin_time=self.context.origin_time,
+            trigger_time=candle["time"]
+        )
+
+        self.context = None  # 🔒 LOCK
+
+    def _cancel(self, reason):
+        print(f"🚫 PROBE CANCELLED — {reason}")
+
+        LifecycleResolved.emit(
+            reason=f"PROBE_{reason}",
+            time=datetime.utcnow()
+        )
+
+        self.context = None

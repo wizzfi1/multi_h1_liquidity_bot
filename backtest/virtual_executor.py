@@ -1,46 +1,47 @@
-class VirtualTrade:
-    def __init__(self, direction, entry, sl, tp, is_flip):
+class VirtualPosition:
+    def __init__(self, direction, entry, sl, tp, open_time):
         self.direction = direction
         self.entry = entry
         self.sl = sl
         self.tp = tp
-        self.is_flip = is_flip
-        self.open = True
-        self.result = None  # "TP" or "SL"
+        self.open_time = open_time
+        self.close_time = None
+        self.result = None  # "TP" | "SL"
 
 
 class VirtualExecutor:
     def __init__(self):
-        self.active_trade = None
-        self.closed_trades = []
+        self.position = None
+        self.history = []
 
-    def place_limit(self, direction, entry, sl, tp, is_flip=False):
-        if self.active_trade:
-            return False
-        self.active_trade = VirtualTrade(direction, entry, sl, tp, is_flip)
+    def place_limit(self, direction, entry, sl, tp, time):
+        self.position = VirtualPosition(direction, entry, sl, tp, time)
         return True
 
-    def on_price(self, high, low):
-        if not self.active_trade:
+    def on_candle(self, candle):
+        if not self.position:
             return None
 
-        t = self.active_trade
+        high = candle["high"]
+        low = candle["low"]
 
-        if t.direction == "BUY":
-            if low <= t.sl:
-                t.result = "SL"
-            elif high >= t.tp:
-                t.result = "TP"
+        pos = self.position
+
+        if pos.direction == "SELL":
+            if high >= pos.sl:
+                pos.result = "SL"
+            elif low <= pos.tp:
+                pos.result = "TP"
         else:
-            if high >= t.sl:
-                t.result = "SL"
-            elif low <= t.tp:
-                t.result = "TP"
+            if low <= pos.sl:
+                pos.result = "SL"
+            elif high >= pos.tp:
+                pos.result = "TP"
 
-        if t.result:
-            t.open = False
-            self.closed_trades.append(t)
-            self.active_trade = None
-            return t.result
+        if pos.result:
+            pos.close_time = candle["time"]
+            self.history.append(pos)
+            self.position = None
+            return pos.result
 
         return None

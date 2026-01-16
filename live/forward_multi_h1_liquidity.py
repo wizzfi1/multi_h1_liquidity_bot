@@ -10,111 +10,91 @@ import MetaTrader5 as mt5
 import pandas as pd
 
 # =============================
-# CORE BOT IMPORTS (UNCHANGED)
+# CONFIG / PLUMBING
 # =============================
 from config.settings import SYMBOL
 from core.mt5_connector import connect
-from core.session_filter import in_session, get_session
+from core.session_filter import get_session
 from core.news_blackout import in_news_blackout
-from core.double_break_detector import DoubleBreakDetector
-from core.entry_engine import EntryEngine
+from core.notifier import send
 from core.risk_manager import RiskManager
 from execution.orders import OrderExecutor
-from core.event_context import EventContext
-from core.notifier import send
-
-
 
 # =============================
-# MULTI-H1 LIQUIDITY IMPORTS
+# MODEL IMPORTS (FINAL)
 # =============================
 from core.h1_liquidity_builder import H1LiquidityBuilder
-from core.liquidity_state import LiquidityState
-from core.liquidity_selector import LiquiditySelector
-from core.liquidity_sweep_detector import LiquiditySweepDetector
-from integration.liquidity_adapter import LiquidityAdapter
-from integration.m5_structure_gate import M5StructureGate
-from integration.primary_entry_adapter import PrimaryEntryAdapter
-
-
-def log_state(state, tag="STATE"):
-    send(
-        f"🧠 {tag}\n"
-        f"locked={state.locked}\n"
-        f"swept={state.swept}\n"
-        f"structure={state.structure_confirmed}\n"
-        f"entry_placed={state.entry_placed}\n"
-        f"flip_active={state.flip_active}"
-    )
+from core.failure_tracker import FailureTracker
+from core.failure_detector import FailureDetector
+from core.origin_candle_locator import OriginCandleLocator
+from core.flip_origin_candle_locator import FlipOriginCandleLocator
+from core.liquidity_event_state import LiquidityEventState
+from integration.structure_resolution_gate import StructureResolutionGate
+from integration.probe_entry_adapter import ProbeEntryAdapter
+from integration.flip_entry_adapter import FlipEntryAdapter
 
 # =============================
 # CONFIG
 # =============================
-ENABLE_TRADING = True   
-ENABLE_FLIP = True
 CHECK_INTERVAL = 10
+ENABLE_TRADING = True
+ENABLE_FLIP = True
 
 # =============================
 # INIT
 # =============================
 connect(SYMBOL)
 
-entry_engine = EntryEngine(SYMBOL)
 risk_manager = RiskManager(SYMBOL)
 executor = OrderExecutor(SYMBOL)
-event = EventContext()
 
 send(
     "🚀 *Live Demo Trading Started — Multi H1 Liquidity*\n"
     f"Symbol: {SYMBOL}\n"
     "Risk: $3000\n"
-    "Liquidity: Multi Unmitigated H1 (Previous Day)\n"
-    "Flip: LIMIT | RR ≥ 5"
+    "Model: Failure → Cleanup → Origin → Probe → Flip"
 )
 
 # =============================
-# BUILD DAILY LIQUIDITY MAP
+# BUILD H1 LIQUIDITY (5 DAYS)
 # =============================
-builder = H1LiquidityBuilder(SYMBOL)
-liquidity_map = builder.build()
+liq_builder = H1LiquidityBuilder(SYMBOL)
+h1_liquidity = liq_builder.build()
 
 send(
-    f"📏 {SYMBOL} — PREVIOUS DAY LIQUIDITY\n"
-    f"Highs: {[l.price for l in liquidity_map['SELL']]}\n"
-    f"Lows: {[l.price for l in liquidity_map['BUY']]}"
+    f"📏 {SYMBOL} — 5-DAY H1 LIQUIDITY\n"
+    f"Highs: {[round(l.price, 5) for l in h1_liquidity['SELL']]}\n"
+    f"Lows: {[round(l.price, 5) for l in h1_liquidity['BUY']]}"
 )
 
-liq_state = LiquidityState()
-liq_selector = LiquiditySelector(liq_state)
-liq_adapter = LiquidityAdapter(liq_selector, liquidity_map)
-sweep_detector = LiquiditySweepDetector(liq_state, send)
+# =============================
+# CORE STATE
+# =============================
+state = LiquidityEventState()
 
-structure_gate = M5StructureGate(
-    liq_state,
-    DoubleBreakDetector,
-    send
-)
+failure_tracker = FailureTracker()
+failure_detector = FailureDetector(failure_tracker)
 
-primary_adapter = PrimaryEntryAdapter(
-    liq_state,
-    entry_engine,
-    executor,
-    risk_manager,
-    send
-)
+origin_locator = OriginCandleLocator()
+flip_origin_locator = FlipOriginCandleLocator()
+
+structure_gate = StructureResolutionGate(state, send)
+
+probe_adapter = ProbeEntryAdapter(risk_manager)
+flip_adapter = FlipEntryAdapter(executor, risk_manager, send)
 
 # =============================
 # HELPERS
 # =============================
-def last_closed_trade():
+def last_closed_deal():
     deals = mt5.history_deals_get(
-        datetime.now(timezone.utc) - pd.Timedelta(hours=12),
+        datetime.now(timezone.utc) - pd.Timedelta(hours=6),
         datetime.now(timezone.utc),
     )
     if not deals:
         return None
     deals = [d for d in deals if d.symbol == SYMBOL]
-    return sorted(deals, key=lambda d: d.time, reverse=True)[0] if deals else None
+    return max(deals, key=lambda d: d.time) if deals else None
 
 # =============================
 # MAIN LOOP
@@ -122,11 +102,17 @@ def last_closed_trade():
 while True:
     now = datetime.now(timezone.utc)
 
-    if not in_session(now) or in_news_blackout():
+    if in_news_blackout():
         time.sleep(CHECK_INTERVAL)
         continue
 
-    m5 = pd.DataFrame(mt5.copy_rates_from_pos(SYMBOL, mt5.TIMEFRAME_M5, 0, 300))
+    # -----------------------------
+    # LOAD M5 DATA
+    # -----------------------------
+    m5 = pd.DataFrame(
+        mt5.copy_rates_from_pos(SYMBOL, mt5.TIMEFRAME_M5, 0, 300)
+    )
+
     if m5.empty:
         time.sleep(CHECK_INTERVAL)
         continue
@@ -134,82 +120,179 @@ while True:
     m5["time"] = pd.to_datetime(m5["time"], unit="s", utc=True)
     last = m5.iloc[-1]
 
-    # =============================
-    # LIQUIDITY SELECTION (LOCKS ONCE)
-    # =============================
-    mid_price = (last["high"] + last["low"]) / 2
-    active_liquidity = liq_adapter.get_active_liquidity(mid_price)
-
-    # =============================
-    # SWEEP DETECTION
-    # =============================
-    tick = mt5.symbol_info_tick(SYMBOL)
-    if tick and active_liquidity:
-        sweep_detector.check(tick.bid, tick.ask)
-
-    # =============================
-    # STRUCTURE CONFIRMATION
-    # =============================
-    structure_gate.on_tick(m5)
-
-    # =============================
-    # PRIMARY ENTRY
-    # =============================
-    if ENABLE_TRADING:
-        placed = primary_adapter.try_place_entry()
-        if placed:
-            payload = liq_state.structure_payload
-            send(
-                f"✅ Entry Placed\n"
-                f"Type: {payload['type']}\n"
-                f"Entry: {payload['entry']}\n"
-                f"SL: {payload['stop_loss']}\n"
-                f"TP: {payload['take_profit']}\n"
-                f"RR: {payload['risk_reward']:.2f}"
-            )
-    # =============================
-    # FLIP LOGIC (UNCHANGED)
-    # =============================
-    if ENABLE_FLIP and event.allow_flip:
-        deal = last_closed_trade()
-        if deal and deal.position_id == event.primary_ticket:
-            if deal.reason == mt5.DEAL_REASON_SL and get_session(
-                datetime.fromtimestamp(deal.time, timezone.utc)
-            ) == event.session:
-
-                plan = entry_engine.build_trade_plan(
-                    type("Signal", (), {"direction": event.flip_direction})(),
-                    event.tp_level,
-                )
-
-                rr = abs(event.tp_level - plan.entry_price) / abs(
-                    plan.entry_price - plan.stop_loss
-                )
-
-                if plan.valid and rr >= 5:
-                    lot = risk_manager.calculate_lot_size(
-                        plan.entry_price, plan.stop_loss
+    # -----------------------------
+    # LIQUIDITY SWEEP (ONE LEVEL ONLY)
+    # -----------------------------
+    if state.active_liquidity is None:
+        tick = mt5.symbol_info_tick(SYMBOL)
+        if tick:
+            # BUY liquidity (price sweeps down)
+            buy_lvls = sorted(h1_liquidity["BUY"], key=lambda x: x.price, reverse=True)
+            for lvl in buy_lvls:
+                if tick.bid <= lvl.price:
+                    state.mark_sweep(lvl, last["time"])
+                    send(
+                        f"🌙 LIQUIDITY SWEPT\n"
+                        f"Type: BUY\n"
+                        f"Level: {lvl.price:.5f}\n"
+                        f"Session: {get_session(last['time'])}"
                     )
-                    ticket = executor.place_limit(
-                        plan.direction,
-                        lot,
-                        plan.entry_price,
-                        plan.stop_loss,
-                        event.tp_level,
+                    break
+
+            # SELL liquidity (price sweeps up)
+            sell_lvls = sorted(h1_liquidity["SELL"], key=lambda x: x.price)
+            for lvl in sell_lvls:
+                if tick.ask >= lvl.price:
+                    state.mark_sweep(lvl, last["time"])
+                    send(
+                        f"🌙 LIQUIDITY SWEPT\n"
+                        f"Type: SELL\n"
+                        f"Level: {lvl.price:.5f}\n"
+                        f"Session: {get_session(last['time'])}"
+                    )
+                    break
+
+    # -----------------------------
+    # FAILURE DETECTION
+    # -----------------------------
+    if state.active_liquidity:
+        probing_sell = state.active_liquidity.type == "BUY"
+
+        failure_detector.on_candle(
+            candle=last,
+            probing_sell=probing_sell
+        )
+
+        state.update_failures(failure_tracker.get_failures())
+
+    # -----------------------------
+    # STRUCTURE RESOLUTION
+    # -----------------------------
+    structure_gate.on_price(
+        high=last["high"],
+        low=last["low"]
+    )
+
+    # -----------------------------
+    # ORIGIN CANDLE (AFTER 1ST BREAK)
+    # -----------------------------
+    if state.break_count == 1 and state.origin_candle is None:
+        origin = origin_locator.locate(
+            m5_df=m5,
+            break_index=len(m5) - 1,
+            direction=state.direction
+        )
+
+        if origin:
+            state.origin_candle = origin
+            send(
+                f"🧠 ORIGIN CANDLE SET\n"
+                f"Time: {origin.time}\n"
+                f"Open: {origin.open:.5f}\n"
+                f"High: {origin.high:.5f}\n"
+                f"Low: {origin.low:.5f}"
+            )
+
+    # -----------------------------
+    # PROBE ENTRY
+    # -----------------------------
+    if (
+        ENABLE_TRADING
+        and state.structure_confirmed
+        and state.origin_candle
+        and not state.probe_placed
+    ):
+        probe_plan = probe_adapter.build(
+            direction=state.direction,
+            origin=state.origin_candle,
+            failures=state.failures,
+        )
+
+        if probe_plan and probe_plan.valid:
+            from execution.target_resolver import TargetResolver
+
+            resolver = TargetResolver(min_rr=5.0)
+            tp = resolver.resolve(
+                direction=probe_plan.direction,
+                entry=probe_plan.entry,
+                stop_loss=probe_plan.stop_loss,
+                liquidity_map=h1_liquidity,
+            )
+
+            if not tp:
+                send("❌ PROBE CANCELLED — RR < 5")
+                state.resolve()
+            else:
+                lot = risk_manager.calculate_lot_size(
+                    probe_plan.entry,
+                    probe_plan.stop_loss
+                )
+
+                ticket = executor.place_limit(
+                    probe_plan.direction,
+                    lot,
+                    probe_plan.entry,
+                    probe_plan.stop_loss,
+                    tp,
+                )
+
+                if ticket:
+                    state.mark_probe_placed(ticket=ticket, sl=probe_plan.stop_loss)
+
+                    send(
+                        f"🎯 PROBE PLACED\n"
+                        f"Direction: {probe_plan.direction}\n"
+                        f"Entry: {probe_plan.entry:.5f}\n"
+                        f"SL: {probe_plan.stop_loss:.5f}\n"
+                        f"TP: {tp:.5f}\n"
+                        f"Risk: $3000\n"
+                        f"SL Source: {probe_plan.sl_source.upper()}"
+                    )
+
+    # -----------------------------
+    # PROBE SL DETECTION
+    # -----------------------------
+    if state.probe_placed and not state.probe_stopped:
+        deal = last_closed_deal()
+
+        if (
+            deal
+            and deal.reason == mt5.DEAL_REASON_SL
+            and deal.position_id == state.probe_ticket
+        ):
+            state.mark_probe_stopped()
+
+            send(
+                "❌ PROBE STOPPED\n"
+                f"Ticket: {deal.position_id}\n"
+                f"Time: {datetime.fromtimestamp(deal.time, timezone.utc)}"
+            )
+
+    # -----------------------------
+    # FLIP ENTRY
+    # -----------------------------
+    if ENABLE_FLIP and state.probe_stopped and not state.flip_used:
+        deal = last_closed_deal()
+
+        if deal and deal.reason == mt5.DEAL_REASON_SL:
+            sl_time = datetime.fromtimestamp(deal.time, timezone.utc)
+            sl_idx = m5.index[m5["time"] >= sl_time]
+
+            if not sl_idx.empty:
+                flip_origin = flip_origin_locator.locate(
+                    m5_df=m5,
+                    sl_index=sl_idx[0],
+                    direction=state.direction
+                )
+
+                if flip_origin:
+                    ticket = flip_adapter.execute(
+                        direction=state.direction,
+                        flip_origin=flip_origin,
+                        liquidity_map=h1_liquidity
                     )
 
                     if ticket:
-                        liq_state.mark_flip_active()
-                        send(
-                            f"🔄 Flip Executed\n"
-                            f"Type: {plan.direction}\n"
-                            f"Entry: {plan.entry_price}\n"
-                            f"SL: {plan.stop_loss}\n"
-                            f"TP: {event.tp_level}\n"
-                            f"RR: {rr:.2f}"
-                        )
-
-                event.resolve()
-                liq_state.unlock()
+                        state.mark_flip_used()
 
     time.sleep(CHECK_INTERVAL)

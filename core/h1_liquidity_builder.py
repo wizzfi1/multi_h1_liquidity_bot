@@ -1,6 +1,18 @@
 import MetaTrader5 as mt5
 from datetime import datetime, timedelta, timezone
-from core.liquidity_models import LiquidityLevel
+from dataclasses import dataclass
+
+
+# =============================
+# DATA MODEL (LOCAL, EXPLICIT)
+# =============================
+@dataclass
+class LiquidityLevel:
+    price: float
+    type: str          # "BUY" or "SELL"
+    timestamp: datetime
+    mitigated: bool = False
+    day_tag: str | None = None  # e.g. D-1, D-2
 
 
 class H1LiquidityBuilder:
@@ -19,7 +31,7 @@ class H1LiquidityBuilder:
 
     def build(self):
         # -----------------------------
-        # Define date window
+        # DATE WINDOW
         # -----------------------------
         today = (
             self.reference_date.date()
@@ -29,7 +41,7 @@ class H1LiquidityBuilder:
 
         start_day = today - timedelta(days=5)
         start = datetime.combine(start_day, datetime.min.time(), tzinfo=timezone.utc)
-        end = datetime.combine(today, datetime.min.time(), tzinfo=timezone.utc)  # today excluded
+        end = datetime.combine(today, datetime.min.time(), tzinfo=timezone.utc)
 
         rates = mt5.copy_rates_range(
             self.symbol,
@@ -43,41 +55,44 @@ class H1LiquidityBuilder:
 
         rates = list(rates)
 
-        raw_sell: list[LiquidityLevel] = []
         raw_buy: list[LiquidityLevel] = []
+        raw_sell: list[LiquidityLevel] = []
 
         # -----------------------------
-        # H1 SWING DETECTION
+        # SWING DETECTION
         # -----------------------------
         for i in range(1, len(rates) - 1):
             prev = rates[i - 1]
             cur = rates[i]
             nxt = rates[i + 1]
 
-            candle_time = datetime.fromtimestamp(cur["time"], tz=timezone.utc)
-            candle_day = candle_time.date()
+            ts = datetime.fromtimestamp(cur["time"], tz=timezone.utc)
+            day_diff = (today - ts.date()).days
 
-            # ❌ ignore current day
-            if candle_day >= today:
+            if day_diff <= 0 or day_diff > 5:
                 continue
 
-            # SELL-side liquidity (swing high)
+            tag = f"D-{day_diff}"
+
+            # SELL liquidity (swing high)
             if cur["high"] > prev["high"] and cur["high"] > nxt["high"]:
                 raw_sell.append(
                     LiquidityLevel(
                         price=float(cur["high"]),
                         type="SELL",
-                        timestamp=candle_time
+                        timestamp=ts,
+                        day_tag=tag
                     )
                 )
 
-            # BUY-side liquidity (swing low)
+            # BUY liquidity (swing low)
             if cur["low"] < prev["low"] and cur["low"] < nxt["low"]:
                 raw_buy.append(
                     LiquidityLevel(
                         price=float(cur["low"]),
                         type="BUY",
-                        timestamp=candle_time
+                        timestamp=ts,
+                        day_tag=tag
                     )
                 )
 
@@ -88,19 +103,17 @@ class H1LiquidityBuilder:
             candle_time = datetime.fromtimestamp(candle["time"], tz=timezone.utc)
 
             for lvl in raw_sell:
-                if lvl.mitigated:
-                    continue
-                if candle_time > lvl.timestamp and candle["high"] >= lvl.price:
-                    lvl.mitigated = True
+                if not lvl.mitigated and candle_time > lvl.timestamp:
+                    if candle["high"] >= lvl.price:
+                        lvl.mitigated = True
 
             for lvl in raw_buy:
-                if lvl.mitigated:
-                    continue
-                if candle_time > lvl.timestamp and candle["low"] <= lvl.price:
-                    lvl.mitigated = True
+                if not lvl.mitigated and candle_time > lvl.timestamp:
+                    if candle["low"] <= lvl.price:
+                        lvl.mitigated = True
 
         # -----------------------------
-        # DEDUPLICATE (KEEP MOST RECENT)
+        # DEDUPE (KEEP MOST RECENT)
         # -----------------------------
         def dedupe(levels):
             by_price = {}

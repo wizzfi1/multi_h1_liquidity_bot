@@ -1,1 +1,17 @@
 .env
+
+config/__pycache__
+
+core/__pycache__
+
+execution/__pycache__
+
+integration/__pycache__
+
+live/__pycache__
+
+utils/__pycache__
+
+tests/__pycache__
+
+backtests/__pycache__

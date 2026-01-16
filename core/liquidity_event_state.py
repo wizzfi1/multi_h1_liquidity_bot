@@ -100,3 +100,80 @@ class LiquidityEventState:
 
     def mark_flip_used(self):
         self.flip_used = True
+
+
+# core/liquidity_event_state.py
+
+class FailureConfirmed:
+    @staticmethod
+    def emit(direction, sweep_time, failure_time):
+        print("❌ FAILURE CONFIRMED")
+        print(f"Direction: {direction}")
+        print(f"Swept at: {sweep_time}")
+        print(f"Failed at: {failure_time}")
+
+
+class OriginConfirmed:
+    @staticmethod
+    def emit(direction, candle):
+        print("🎯 ORIGIN CONFIRMED")
+        print(f"Direction: {direction}")
+        print(f"Time: {candle['time']}")
+        print(
+            f"O:{candle['open']} H:{candle['high']} "
+            f"L:{candle['low']} C:{candle['close']}"
+        )
+
+
+class ProbeTriggered:
+    @staticmethod
+    def emit(direction, origin_high, origin_low, origin_time, trigger_time):
+        print("🎯 PROBE TRIGGERED")
+        print(f"Direction: {direction}")
+        print(f"Origin range: {origin_low} → {origin_high}")
+        print(f"Origin time: {origin_time}")
+        print(f"Trigger time: {trigger_time}")
+
+class CleanupConfirmed:
+    @staticmethod
+    def emit(failure_direction, cleanup_time):
+        print("🧹 CLEANUP CONFIRMED")
+        print(f"Failure Direction: {failure_direction}")
+        print(f"Cleanup Time: {cleanup_time}")
+
+class LifecycleResolved:
+    @staticmethod
+    def emit(reason: str, time):
+        print("🔓 LIFECYCLE RESOLVED")
+        print(f"Reason: {reason}")
+        print(f"Time: {time}")
+
+class LifecycleResolved:
+    _handler = None
+
+    @staticmethod
+    def emit(reason: str, time):
+        print("🔓 LIFECYCLE RESOLVED")
+        print(f"Reason: {reason}")
+        print(f"Time: {time}")
+
+        if LifecycleResolved._handler:
+            LifecycleResolved._handler(reason, time)
+
+
+class ProbeTriggered:
+    _handler = None
+
+    @staticmethod
+    def emit(direction, origin_high, origin_low, origin_time, trigger_time):
+        print("🎯 PROBE TRIGGERED")
+        print(f"Direction: {direction}")
+        print(f"Origin range: {origin_low} → {origin_high}")
+
+        if ProbeTriggered._handler:
+            ProbeTriggered._handler(
+                direction,
+                origin_high,
+                origin_low,
+                trigger_time
+            )

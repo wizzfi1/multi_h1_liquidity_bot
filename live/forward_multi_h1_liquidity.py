@@ -9,99 +9,128 @@ sys.path.insert(0, PROJECT_ROOT)
 import MetaTrader5 as mt5
 import pandas as pd
 
-# =============================
-# CONFIG / PLUMBING
-# =============================
 from config.settings import SYMBOL
 from core.mt5_connector import connect
-from core.session_filter import get_session
 from core.news_blackout import in_news_blackout
 from core.notifier import send
-from core.risk_manager import RiskManager
-from execution.orders import OrderExecutor
 
-# =============================
-# MODEL IMPORTS (FINAL)
-# =============================
-from core.h1_liquidity_builder import H1LiquidityBuilder
-from core.failure_tracker import FailureTracker
+from core.persistence import load_state, save_state
+
+# ─────────────────────────────────────────────
+# CORE ENGINE IMPORTS
+# ─────────────────────────────────────────────
+from core.h1_liquidity_builder import H1LiquidityBuilder, LiquidityLevel
 from core.failure_detector import FailureDetector
-from core.origin_candle_locator import OriginCandleLocator
-from core.flip_origin_candle_locator import FlipOriginCandleLocator
-from core.liquidity_event_state import LiquidityEventState
+from core.cleanup_detector import CleanupDetector
+from core.origin_candle_locator import OriginLocator
+from core.entry_engine import EntryEngine
+from core.flip_executor import FlipExecutor
+
 from integration.structure_resolution_gate import StructureResolutionGate
-from integration.probe_entry_adapter import ProbeEntryAdapter
-from integration.flip_entry_adapter import FlipEntryAdapter
+from core.liquidity_event_state import LifecycleResolved, ProbeTriggered
 
-# =============================
-# CONFIG
-# =============================
-CHECK_INTERVAL = 10
-ENABLE_TRADING = True
-ENABLE_FLIP = True
+from datetime import time as dtime
 
-# =============================
+NY_CLOSE_UTC = dtime(hour=21, minute=0)  # 21:00 UTC
+
+def is_trading_session(now_utc):
+    return dtime(8, 0) <= now_utc.time() < dtime(21, 0)
+
+
+# ─────────────────────────────────────────────
+# SESSION HELPERS
+# ─────────────────────────────────────────────
+def is_trading_session(now_utc):
+    """
+    Only trade London + New York.
+    Asia is explicitly excluded.
+    """
+    return dtime(8, 0) <= now_utc.time() < dtime(21, 0)
+
+
+# ─────────────────────────────────────────────
 # INIT
-# =============================
+# ─────────────────────────────────────────────
 connect(SYMBOL)
 
-risk_manager = RiskManager(SYMBOL)
-executor = OrderExecutor(SYMBOL)
-
 send(
-    "🚀 *Live Demo Trading Started — Multi H1 Liquidity*\n"
+    "🚀 Live Demo — Multi-H1 Liquidity (Event-Driven)\n"
     f"Symbol: {SYMBOL}\n"
-    "Risk: $3000\n"
-    "Model: Failure → Cleanup → Origin → Probe → Flip"
+    "Model: Sweep → Failure → Cleanup → Origin → Probe → Flip"
 )
 
-# =============================
-# BUILD H1 LIQUIDITY (5 DAYS)
-# =============================
-liq_builder = H1LiquidityBuilder(SYMBOL)
-h1_liquidity = liq_builder.build()
+# ─────────────────────────────────────────────
+# LOAD OR BUILD H1 LIQUIDITY (PERSISTENT)
+# ─────────────────────────────────────────────
+persisted, active_lifecycle = load_state()
 
-send(
-    f"📏 {SYMBOL} — 5-DAY H1 LIQUIDITY\n"
-    f"Highs: {[round(l.price, 5) for l in h1_liquidity['SELL']]}\n"
-    f"Lows: {[round(l.price, 5) for l in h1_liquidity['BUY']]}"
+if persisted:
+    send("♻️ Restoring persisted state")
+
+    h1_liquidity = {"BUY": [], "SELL": []}
+
+    for side, levels in persisted["liquidity"].items():
+        for raw in levels:
+            h1_liquidity[side].append(
+                LiquidityLevel(
+                    price=raw["price"],
+                    type=raw["type"],
+                    timestamp=datetime.fromisoformat(raw["timestamp"]),
+                    mitigated=raw["mitigated"],
+                    day_tag=raw["day_tag"],
+                )
+            )
+else:
+    liq_builder = H1LiquidityBuilder(SYMBOL)
+    h1_liquidity = liq_builder.build()
+    active_lifecycle = False
+    save_state(h1_liquidity, active_lifecycle)
+
+# ─────────────────────────────────────────────
+# ENGINE COMPONENTS
+# ─────────────────────────────────────────────
+failure_detector = FailureDetector()
+cleanup_detector = CleanupDetector()
+origin_locator = OriginLocator()
+probe_engine = EntryEngine()
+flip_executor = FlipExecutor(SYMBOL)
+
+structure_gate = StructureResolutionGate(
+    failure_detector=failure_detector,
+    cleanup_detector=cleanup_detector
 )
 
-# =============================
-# CORE STATE
-# =============================
-state = LiquidityEventState()
+# ─────────────────────────────────────────────
+# EVENT WIRING
+# ─────────────────────────────────────────────
+ProbeTriggered._handler = flip_executor.on_probe_triggered
 
-failure_tracker = FailureTracker()
-failure_detector = FailureDetector(failure_tracker)
 
-origin_locator = OriginCandleLocator()
-flip_origin_locator = FlipOriginCandleLocator()
+# ─────────────────────────────────────────────
+# LIFECYCLE RESOLUTION HANDLER (PERSISTENT)
+# ─────────────────────────────────────────────
+def handle_lifecycle_resolved(reason, time):
+    global active_lifecycle
+    active_lifecycle = False
 
-structure_gate = StructureResolutionGate(state, send)
+    save_state(h1_liquidity, active_lifecycle)
 
-probe_adapter = ProbeEntryAdapter(risk_manager)
-flip_adapter = FlipEntryAdapter(executor, risk_manager, send)
-
-# =============================
-# HELPERS
-# =============================
-def last_closed_deal():
-    deals = mt5.history_deals_get(
-        datetime.now(timezone.utc) - pd.Timedelta(hours=6),
-        datetime.now(timezone.utc),
+    send(
+        "🔓 LIFECYCLE RESOLVED\n"
+        f"Reason: {reason}\n"
+        f"Time: {time}"
     )
-    if not deals:
-        return None
-    deals = [d for d in deals if d.symbol == SYMBOL]
-    return max(deals, key=lambda d: d.time) if deals else None
 
-# =============================
+
+LifecycleResolved._handler = handle_lifecycle_resolved
+
+
+# ─────────────────────────────────────────────
 # MAIN LOOP
-# =============================
-while True:
-    now = datetime.now(timezone.utc)
+# ─────────────────────────────────────────────
+CHECK_INTERVAL = 10
 
+while True:
     if in_news_blackout():
         time.sleep(CHECK_INTERVAL)
         continue
@@ -110,7 +139,7 @@ while True:
     # LOAD M5 DATA
     # -----------------------------
     m5 = pd.DataFrame(
-        mt5.copy_rates_from_pos(SYMBOL, mt5.TIMEFRAME_M5, 0, 300)
+        mt5.copy_rates_from_pos(SYMBOL, mt5.TIMEFRAME_M5, 0, 5)
     )
 
     if m5.empty:
@@ -118,181 +147,95 @@ while True:
         continue
 
     m5["time"] = pd.to_datetime(m5["time"], unit="s", utc=True)
-    last = m5.iloc[-1]
+    candle = m5.iloc[-1]
 
-    # -----------------------------
-    # LIQUIDITY SWEEP (ONE LEVEL ONLY)
-    # -----------------------------
-    if state.active_liquidity is None:
-        tick = mt5.symbol_info_tick(SYMBOL)
-        if tick:
-            # BUY liquidity (price sweeps down)
-            buy_lvls = sorted(h1_liquidity["BUY"], key=lambda x: x.price, reverse=True)
-            for lvl in buy_lvls:
-                if tick.bid <= lvl.price:
-                    state.mark_sweep(lvl, last["time"])
-                    send(
-                        f"🌙 LIQUIDITY SWEPT\n"
-                        f"Type: BUY\n"
-                        f"Level: {lvl.price:.5f}\n"
-                        f"Session: {get_session(last['time'])}"
-                    )
-                    break
+    tick = mt5.symbol_info_tick(SYMBOL)
+    if not tick:
+        time.sleep(CHECK_INTERVAL)
+        continue
 
-            # SELL liquidity (price sweeps up)
-            sell_lvls = sorted(h1_liquidity["SELL"], key=lambda x: x.price)
-            for lvl in sell_lvls:
-                if tick.ask >= lvl.price:
-                    state.mark_sweep(lvl, last["time"])
-                    send(
-                        f"🌙 LIQUIDITY SWEPT\n"
-                        f"Type: SELL\n"
-                        f"Level: {lvl.price:.5f}\n"
-                        f"Session: {get_session(last['time'])}"
-                    )
-                    break
+    # --------------------------------------------------
+    # NEW YORK CLOSE — FORCE LIFECYCLE RESOLUTION
+    # --------------------------------------------------
+    now = datetime.now(timezone.utc)
 
-    # -----------------------------
-    # FAILURE DETECTION
-    # -----------------------------
-    if state.active_liquidity:
-        probing_sell = state.active_liquidity.type == "BUY"
+    if active_lifecycle and now.time() >= NY_CLOSE_UTC:
+        from core.liquidity_event_state import LifecycleResolved
 
-        failure_detector.on_candle(
-            candle=last,
-            probing_sell=probing_sell
+        LifecycleResolved.emit(
+            reason="NY_SESSION_END",
+            time=now
         )
 
-        state.update_failures(failure_tracker.get_failures())
+        active_lifecycle = False
 
-    # -----------------------------
-    # STRUCTURE RESOLUTION
-    # -----------------------------
-    structure_gate.on_price(
-        high=last["high"],
-        low=last["low"]
-    )
-
-    # -----------------------------
-    # ORIGIN CANDLE (AFTER 1ST BREAK)
-    # -----------------------------
-    if state.break_count == 1 and state.origin_candle is None:
-        origin = origin_locator.locate(
-            m5_df=m5,
-            break_index=len(m5) - 1,
-            direction=state.direction
+        # Persist state immediately
+        save_state(
+            active_lifecycle=active_lifecycle,
+            h1_liquidity=h1_liquidity
         )
 
-        if origin:
-            state.origin_candle = origin
-            send(
-                f"🧠 ORIGIN CANDLE SET\n"
-                f"Time: {origin.time}\n"
-                f"Open: {origin.open:.5f}\n"
-                f"High: {origin.high:.5f}\n"
-                f"Low: {origin.low:.5f}"
-            )
-
-    # -----------------------------
-    # PROBE ENTRY
-    # -----------------------------
-    if (
-        ENABLE_TRADING
-        and state.structure_confirmed
-        and state.origin_candle
-        and not state.probe_placed
-    ):
-        probe_plan = probe_adapter.build(
-            direction=state.direction,
-            origin=state.origin_candle,
-            failures=state.failures,
+        send(
+            "⏱️ NY SESSION CLOSED\n"
+            "Lifecycle auto-resolved\n"
+            "Engine unlocked for next London session"
         )
 
-        if probe_plan and probe_plan.valid:
-            from execution.target_resolver import TargetResolver
+        time.sleep(CHECK_INTERVAL)
+        continue
 
-            resolver = TargetResolver(min_rr=5.0)
-            tp = resolver.resolve(
-                direction=probe_plan.direction,
-                entry=probe_plan.entry,
-                stop_loss=probe_plan.stop_loss,
-                liquidity_map=h1_liquidity,
-            )
+    # -----------------------------
+    # LIQUIDITY SWEEP (GLOBAL + PERSISTENT)
+    # -----------------------------
+    if not active_lifecycle:
 
-            if not tp:
-                send("❌ PROBE CANCELLED — RR < 5")
-                state.resolve()
-            else:
-                lot = risk_manager.calculate_lot_size(
-                    probe_plan.entry,
-                    probe_plan.stop_loss
+        # BUY liquidity
+        for lvl in h1_liquidity["BUY"]:
+            if lvl.mitigated:
+                continue
+
+            if tick.bid <= lvl.price:
+                lvl.mitigated = True
+                active_lifecycle = True
+
+                save_state(h1_liquidity, active_lifecycle)
+
+                failure_detector.on_liquidity_swept(
+                    direction="BUY",
+                    time=candle["time"]
                 )
 
-                ticket = executor.place_limit(
-                    probe_plan.direction,
-                    lot,
-                    probe_plan.entry,
-                    probe_plan.stop_loss,
-                    tp,
+                send(f"🌙 BUY liquidity swept @ {lvl.price}")
+                break
+
+        # SELL liquidity
+        for lvl in h1_liquidity["SELL"]:
+            if lvl.mitigated:
+                continue
+
+            if tick.ask >= lvl.price:
+                lvl.mitigated = True
+                active_lifecycle = True
+
+                save_state(h1_liquidity, active_lifecycle)
+
+                failure_detector.on_liquidity_swept(
+                    direction="SELL",
+                    time=candle["time"]
                 )
 
-                if ticket:
-                    state.mark_probe_placed(ticket=ticket, sl=probe_plan.stop_loss)
-
-                    send(
-                        f"🎯 PROBE PLACED\n"
-                        f"Direction: {probe_plan.direction}\n"
-                        f"Entry: {probe_plan.entry:.5f}\n"
-                        f"SL: {probe_plan.stop_loss:.5f}\n"
-                        f"TP: {tp:.5f}\n"
-                        f"Risk: $3000\n"
-                        f"SL Source: {probe_plan.sl_source.upper()}"
-                    )
+                send(f"🌙 SELL liquidity swept @ {lvl.price}")
+                break
 
     # -----------------------------
-    # PROBE SL DETECTION
+    # STRUCTURE → FAILURE / CLEANUP
     # -----------------------------
-    if state.probe_placed and not state.probe_stopped:
-        deal = last_closed_deal()
-
-        if (
-            deal
-            and deal.reason == mt5.DEAL_REASON_SL
-            and deal.position_id == state.probe_ticket
-        ):
-            state.mark_probe_stopped()
-
-            send(
-                "❌ PROBE STOPPED\n"
-                f"Ticket: {deal.position_id}\n"
-                f"Time: {datetime.fromtimestamp(deal.time, timezone.utc)}"
-            )
+    structure_gate.on_candle(candle)
 
     # -----------------------------
-    # FLIP ENTRY
+    # ORIGIN & PROBE
     # -----------------------------
-    if ENABLE_FLIP and state.probe_stopped and not state.flip_used:
-        deal = last_closed_deal()
-
-        if deal and deal.reason == mt5.DEAL_REASON_SL:
-            sl_time = datetime.fromtimestamp(deal.time, timezone.utc)
-            sl_idx = m5.index[m5["time"] >= sl_time]
-
-            if not sl_idx.empty:
-                flip_origin = flip_origin_locator.locate(
-                    m5_df=m5,
-                    sl_index=sl_idx[0],
-                    direction=state.direction
-                )
-
-                if flip_origin:
-                    ticket = flip_adapter.execute(
-                        direction=state.direction,
-                        flip_origin=flip_origin,
-                        liquidity_map=h1_liquidity
-                    )
-
-                    if ticket:
-                        state.mark_flip_used()
+    origin_locator.on_candle_closed(candle)
+    probe_engine.on_candle_closed(candle)
 
     time.sleep(CHECK_INTERVAL)

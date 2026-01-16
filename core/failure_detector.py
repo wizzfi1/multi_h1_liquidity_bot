@@ -1,53 +1,55 @@
+from dataclasses import dataclass
 from datetime import datetime
-from core.failure_tracker import Failure, FailureTracker
+from enum import Enum
+
+from core.liquidity_event_state import FailureConfirmed
+
+
+class Direction(Enum):
+    BUY = "BUY"
+    SELL = "SELL"
+
+
+@dataclass
+class LiquidityAttempt:
+    direction: Direction
+    sweep_time: datetime
+    failed: bool = False
 
 
 class FailureDetector:
     """
-    Detects failed BUY or SELL attempts on M5.
+    Declares failure ONLY on structural contradiction.
     """
 
-    def __init__(self, tracker: FailureTracker):
-        self.tracker = tracker
+    def __init__(self):
+        self.attempt: LiquidityAttempt | None = None
+        self.last_sweep_time: datetime | None = None
 
-    def on_candle(self, candle, probing_sell: bool):
-        """
-        probing_sell = True  → looking for BUY failures
-        probing_sell = False → looking for SELL failures
-        """
-        time = candle["time"]
+    def on_liquidity_swept(self, direction: str, time: datetime):
+        if self.last_sweep_time == time:
+            return
+        if self.attempt is not None:
+            return
 
-        if probing_sell:
-            self._detect_buy_failure(candle, time)
-        else:
-            self._detect_sell_failure(candle, time)
+        self.attempt = LiquidityAttempt(
+            direction=Direction(direction),
+            sweep_time=time
+        )
+        self.last_sweep_time = time
 
-    # ----------------------------------------
-    # BUY FAILURE
-    # Price tries to go up → rejected → closes down
-    # ----------------------------------------
-    def _detect_buy_failure(self, candle, time: datetime):
-        if candle["high"] > candle["open"] and candle["close"] < candle["open"]:
-            self.tracker.add_failure(
-                Failure(
-                    defensive_level=candle["high"],
-                    time=time,
-                    direction="BUY",
-                )
+    def on_structure_break(self, direction: str, time: datetime):
+        if not self.attempt or self.attempt.failed:
+            return
+
+        # 🔴 STRUCTURAL CONTRADICTION
+        if direction != self.attempt.direction.value:
+            self.attempt.failed = True
+
+            FailureConfirmed.emit(
+                direction=self.attempt.direction.value,
+                sweep_time=self.attempt.sweep_time,
+                failure_time=time
             )
 
-
-    # ----------------------------------------
-    # SELL FAILURE
-    # Price tries to go down → rejected → closes up
-    # ----------------------------------------
-    def _detect_sell_failure(self, candle, time: datetime):
-        if candle["low"] < candle["open"] and candle["close"] > candle["open"]:
-            self.tracker.add_failure(
-                Failure(
-                    defensive_level=candle["low"],
-                    time=time,
-                    direction="SELL",
-                )
-            )
-
+            self.attempt = None  # lock

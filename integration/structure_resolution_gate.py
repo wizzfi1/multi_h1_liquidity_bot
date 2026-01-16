@@ -1,85 +1,59 @@
 # integration/structure_resolution_gate.py
 
-from core.liquidity_event_state import LiquidityEventState
-from core.failure_tracker import Failure
-
-
 class StructureResolutionGate:
     """
-    Confirms structure by sequentially cleaning the
-    defensive levels of the TWO most recent failures.
+    Emits raw structure break events.
+    No state resolution, no levels, no failures.
     """
 
-    def __init__(self, state: LiquidityEventState, notifier):
-        self.state = state
-        self.notifier = notifier
+    def __init__(self, failure_detector, cleanup_detector):
+        self.failure_detector = failure_detector
+        self.cleanup_detector = cleanup_detector
 
-    # --------------------------------------------------
-    # Main update
-    # --------------------------------------------------
+        self.last_high = None
+        self.last_low = None
 
-    def on_price(self, high: float, low: float):
-        """
-        Call on every candle / tick.
-        """
+    def on_candle(self, candle):
+        high = candle["high"]
+        low = candle["low"]
+        time = candle["time"]
 
-        # Preconditions
-        if not self.state.active_liquidity:
+        # Initialize
+        if self.last_high is None or self.last_low is None:
+            self.last_high = high
+            self.last_low = low
             return
 
-        if not self.state.has_two_failures():
-            return
+        # -----------------------------
+        # BUY structure break
+        # -----------------------------
+        if high > self.last_high:
+            # Emit to Failure + Cleanup
+            self.failure_detector.on_structure_break(
+                direction="BUY",
+                time=time
+            )
 
-        if not self.state.has_post_sweep_failure():
-            return
+            self.cleanup_detector.on_structure_break(
+                direction="BUY",
+                time=time
+            )
 
-        if self.state.structure_confirmed:
-            return
+            self.last_high = high
 
-        # Determine which failures we are resolving
-        f1, f2 = self.state.failures
+        # -----------------------------
+        # SELL structure break
+        # -----------------------------
+        if low < self.last_low:
+            # Emit to Failure + Cleanup
+            self.failure_detector.on_structure_break(
+                direction="SELL",
+                time=time
+            )
 
-        # Nearest defensive level first
-        defensive_levels = sorted(
-            [f1.defensive_level, f2.defensive_level],
-            key=lambda x: abs(x - ((high + low) / 2))
-        )
+            self.cleanup_detector.on_structure_break(
+                direction="SELL",
+                time=time
+            )
 
-        nearest = defensive_levels[0]
-        second = defensive_levels[1]
-
-        # Direction logic (mirror-safe)
-        probing_sell = self.state.active_liquidity.type == "BUY"
-
-        # --------------------------------------------------
-        # BREAK LOGIC
-        # --------------------------------------------------
-
-        if self.state.break_count == 0:
-            if probing_sell and low < nearest:
-                self.state.register_break(nearest)
-                self.notifier(f"🔹 1st defensive level cleaned: {nearest}")
-            elif not probing_sell and high > nearest:
-                self.state.register_break(nearest)
-                self.notifier(f"🔹 1st defensive level cleaned: {nearest}")
-
-        elif self.state.break_count == 1:
-            # Invalidation check
-            if probing_sell and high > self.state.last_broken_level:
-                self.notifier("❌ Break invalidated — reset break count")
-                self.state.reset_break_progress()
-                return
-
-            if not probing_sell and low < self.state.last_broken_level:
-                self.notifier("❌ Break invalidated — reset break count")
-                self.state.reset_break_progress()
-                return
-
-            # Second break
-            if probing_sell and low < second:
-                self.state.register_break(second)
-                self.notifier("✅ Structure confirmed (2nd break)")
-
-            elif not probing_sell and high > second:
-                self.state.register_break(second)
-                self.notifier("✅ Structure confirmed (2nd break)")
+            self.last_low = low

@@ -1,80 +1,16 @@
 {
-  "active_lifecycle": true,
+  "active_lifecycle": false,
   "liquidity": {
-    "SELL": [
+    "BUY_SIDE": [
       {
-        "price": 1.16982,
-        "type": "SELL",
-        "timestamp": "2026-01-12T13:00:00+00:00",
+        "price": 1.16453,
+        "type": "BUY_SIDE",
+        "timestamp": "2026-01-15T00:00:00+00:00",
         "mitigated": false,
         "day_tag": "D-4"
-      },
-      {
-        "price": 1.16772,
-        "type": "SELL",
-        "timestamp": "2026-01-13T13:00:00+00:00",
-        "mitigated": false,
-        "day_tag": "D-3"
-      },
-      {
-        "price": 1.16612,
-        "type": "SELL",
-        "timestamp": "2026-01-14T16:00:00+00:00",
-        "mitigated": false,
-        "day_tag": "D-2"
-      },
-      {
-        "price": 1.16469,
-        "type": "SELL",
-        "timestamp": "2026-01-14T20:00:00+00:00",
-        "mitigated": false,
-        "day_tag": "D-2"
-      },
-      {
-        "price": 1.16466,
-        "type": "SELL",
-        "timestamp": "2026-01-14T23:00:00+00:00",
-        "mitigated": false,
-        "day_tag": "D-2"
-      },
-      {
-        "price": 1.16411,
-        "type": "SELL",
-        "timestamp": "2026-01-15T03:00:00+00:00",
-        "mitigated": false,
-        "day_tag": "D-1"
-      },
-      {
-        "price": 1.16405,
-        "type": "SELL",
-        "timestamp": "2026-01-15T10:00:00+00:00",
-        "mitigated": false,
-        "day_tag": "D-1"
-      },
-      {
-        "price": 1.1616900000000001,
-        "type": "SELL",
-        "timestamp": "2026-01-15T19:00:00+00:00",
-        "mitigated": true,
-        "day_tag": "D-1"
-      },
-      {
-        "price": 1.16097,
-        "type": "SELL",
-        "timestamp": "2026-01-15T23:00:00+00:00",
-        "mitigated": false,
-        "day_tag": "D-1"
       }
     ],
-    "BUY": [
-      {
-        "price": 1.15928,
-        "type": "BUY",
-        "timestamp": "2026-01-15T14:00:00+00:00",
-        "mitigated": false,
-        "day_tag": "D-1"
-      }
-    ]
+    "SELL_SIDE": []
   },
-  "saved_at": "2026-01-16T15:05:31.827801"
+  "saved_at": "2026-01-19T08:43:54.235100"
 }

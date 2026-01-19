@@ -2,6 +2,7 @@ import sys
 import os
 import time
 from datetime import datetime, timezone
+from datetime import time as dtime
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
@@ -29,23 +30,45 @@ from core.flip_executor import FlipExecutor
 from integration.structure_resolution_gate import StructureResolutionGate
 from core.liquidity_event_state import LifecycleResolved, ProbeTriggered
 
-from datetime import time as dtime
 
+# ─────────────────────────────────────────────
+# SESSION CONSTANTS
+# ─────────────────────────────────────────────
 NY_CLOSE_UTC = dtime(hour=21, minute=0)  # 21:00 UTC
 
-def is_trading_session(now_utc):
-    return dtime(8, 0) <= now_utc.time() < dtime(21, 0)
 
-
-# ─────────────────────────────────────────────
-# SESSION HELPERS
-# ─────────────────────────────────────────────
 def is_trading_session(now_utc):
     """
     Only trade London + New York.
     Asia is explicitly excluded.
     """
-    return dtime(8, 0) <= now_utc.time() < dtime(21, 0)
+    return dtime(7, 0) <= now_utc.time() < dtime(21, 0)
+
+
+# ─────────────────────────────────────────────
+# TELEMETRY HELPERS
+# ─────────────────────────────────────────────
+def nearest_unswept(levels, price, side):
+    candidates = [lvl for lvl in levels if not lvl.mitigated]
+
+    if not candidates:
+        return None
+
+    # BUY_SIDE = upside stops
+    if side == "BUY_SIDE":
+        above = [lvl for lvl in candidates if lvl.price >= price]
+        return min(above, key=lambda x: x.price, default=None)
+
+    # SELL_SIDE = downside stops
+    if side == "SELL_SIDE":
+        below = [lvl for lvl in candidates if lvl.price <= price]
+        return max(below, key=lambda x: x.price, default=None)
+
+    return None
+
+
+last_status_log = None
+STATUS_INTERVAL_SECONDS = 300  # 5 minutes
 
 
 # ─────────────────────────────────────────────
@@ -67,7 +90,7 @@ persisted, active_lifecycle = load_state()
 if persisted:
     send("♻️ Restoring persisted state")
 
-    h1_liquidity = {"BUY": [], "SELL": []}
+    h1_liquidity = {"BUY_SIDE": [], "SELL_SIDE": []}
 
     for side, levels in persisted["liquidity"].items():
         for raw in levels:
@@ -154,25 +177,15 @@ while True:
         time.sleep(CHECK_INTERVAL)
         continue
 
+    now = datetime.now(timezone.utc)
+
     # --------------------------------------------------
     # NEW YORK CLOSE — FORCE LIFECYCLE RESOLUTION
     # --------------------------------------------------
-    now = datetime.now(timezone.utc)
-
     if active_lifecycle and now.time() >= NY_CLOSE_UTC:
-        from core.liquidity_event_state import LifecycleResolved
-
         LifecycleResolved.emit(
             reason="NY_SESSION_END",
             time=now
-        )
-
-        active_lifecycle = False
-
-        # Persist state immediately
-        save_state(
-            active_lifecycle=active_lifecycle,
-            h1_liquidity=h1_liquidity
         )
 
         send(
@@ -184,13 +197,56 @@ while True:
         time.sleep(CHECK_INTERVAL)
         continue
 
-    # -----------------------------
-    # LIQUIDITY SWEEP (GLOBAL + PERSISTENT)
-    # -----------------------------
-    if not active_lifecycle:
+    # --------------------------------------------------
+    # ENGINE STATUS TELEMETRY
+    # --------------------------------------------------
+    if (
+        last_status_log is None
+        or (now - last_status_log).total_seconds() >= STATUS_INTERVAL_SECONDS
+    ):
+        last_status_log = now
 
-        # BUY liquidity
-        for lvl in h1_liquidity["BUY"]:
+        session = "OUTSIDE"
+        if is_trading_session(now):
+            session = "LONDON/NY"
+
+        price = tick.bid
+
+        nearest_buy_side = nearest_unswept(h1_liquidity["BUY_SIDE"], price, "BUY_SIDE")
+        nearest_sell_side = nearest_unswept(h1_liquidity["SELL_SIDE"], price, "SELL_SIDE")
+
+        lines = [
+            "📡 ENGINE STATUS",
+            "",
+            f"Lifecycle: {'ACTIVE' if active_lifecycle else 'IDLE'}",
+            f"Current Price: {price:.5f}",
+            f"Session: {session}",
+            "",
+        ]
+
+        if nearest_buy_side:
+            lines.append(
+                f"Nearest BUY-SIDE liquidity: {nearest_buy_side.price:.5f} ({nearest_buy_side.day_tag})"
+            )
+        else:
+            lines.append("Nearest BUY-SIDE liquidity: NONE")
+
+        if nearest_sell_side:
+            lines.append(
+                f"Nearest SELL-SIDE liquidity: {nearest_sell_side.price:.5f} ({nearest_sell_side.day_tag})"
+            )
+        else:
+            lines.append("Nearest SELL-SIDE liquidity: NONE")
+
+        send("\n".join(lines))
+
+    # -----------------------------
+    # LIQUIDITY SWEEP (GLOBAL + SESSION + PERSISTENT)
+    # -----------------------------
+    if not active_lifecycle and is_trading_session(now):
+
+        # SELL-SIDE liquidity (downside stops)
+        for lvl in h1_liquidity["SELL_SIDE"]:
             if lvl.mitigated:
                 continue
 
@@ -201,15 +257,15 @@ while True:
                 save_state(h1_liquidity, active_lifecycle)
 
                 failure_detector.on_liquidity_swept(
-                    direction="BUY",
+                    direction="SELL_SIDE",
                     time=candle["time"]
                 )
 
-                send(f"🌙 BUY liquidity swept @ {lvl.price}")
+                send(f"🌙 SELL-SIDE liquidity swept @ {lvl.price}")
                 break
 
-        # SELL liquidity
-        for lvl in h1_liquidity["SELL"]:
+        # BUY-SIDE liquidity (upside stops)
+        for lvl in h1_liquidity["BUY_SIDE"]:
             if lvl.mitigated:
                 continue
 
@@ -220,11 +276,11 @@ while True:
                 save_state(h1_liquidity, active_lifecycle)
 
                 failure_detector.on_liquidity_swept(
-                    direction="SELL",
+                    direction="BUY_SIDE",
                     time=candle["time"]
                 )
 
-                send(f"🌙 SELL liquidity swept @ {lvl.price}")
+                send(f"🌙 BUY-SIDE liquidity swept @ {lvl.price}")
                 break
 
     # -----------------------------

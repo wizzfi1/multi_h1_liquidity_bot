@@ -1,6 +1,7 @@
 import MetaTrader5 as mt5
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
+from collections import defaultdict
 
 
 # =============================
@@ -9,30 +10,29 @@ from dataclasses import dataclass
 @dataclass
 class LiquidityLevel:
     price: float
-    type: str          # "BUY" or "SELL"
+    type: str          # "BUY_SIDE" or "SELL_SIDE"
     timestamp: datetime
     mitigated: bool = False
-    day_tag: str | None = None  # e.g. D-1, D-2
+    day_tag: str | None = None
 
 
 class H1LiquidityBuilder:
     """
-    Builds H1 structural liquidity from the last 5 completed UTC days (excluding today).
+    Builds REAL H1 liquidity from the last 5 completed UTC days.
 
-    Liquidity definition:
-    - H1 swing highs / lows
-    - Formed on D-1 ... D-5
-    - Not mitigated at any point after formation
+    Liquidity definition (minimum viable institutional):
+    1) Prior Day High / Low
+    2) Multi-touch H1 clusters (>= 2 reactions within tolerance)
     """
+
+    CLUSTER_TOLERANCE = 0.0005   # 5 pips
+    MIN_TOUCHES = 2
 
     def __init__(self, symbol: str, reference_date: datetime | None = None):
         self.symbol = symbol
         self.reference_date = reference_date
 
     def build(self):
-        # -----------------------------
-        # DATE WINDOW
-        # -----------------------------
         today = (
             self.reference_date.date()
             if self.reference_date
@@ -50,81 +50,135 @@ class H1LiquidityBuilder:
             end
         )
 
-        if rates is None or len(rates) < 5:
-            return {"BUY": [], "SELL": []}
+        if rates is None or len(rates) < 50:
+            return {"BUY_SIDE": [], "SELL_SIDE": []}
 
         rates = list(rates)
 
-        raw_buy: list[LiquidityLevel] = []
-        raw_sell: list[LiquidityLevel] = []
+        liquidity = {"BUY_SIDE": [], "SELL_SIDE": []}
 
         # -----------------------------
-        # SWING DETECTION
+        # 1️⃣ PRIOR DAY HIGH / LOW
         # -----------------------------
-        for i in range(1, len(rates) - 1):
-            prev = rates[i - 1]
-            cur = rates[i]
-            nxt = rates[i + 1]
+        by_day = defaultdict(list)
 
-            ts = datetime.fromtimestamp(cur["time"], tz=timezone.utc)
-            day_diff = (today - ts.date()).days
+        for candle in rates:
+            ts = datetime.fromtimestamp(candle["time"], tz=timezone.utc)
+            by_day[ts.date()].append(candle)
 
+        for day, candles in by_day.items():
+            day_diff = (today - day).days
             if day_diff <= 0 or day_diff > 5:
                 continue
 
+            high = max(c["high"] for c in candles)
+            low = min(c["low"] for c in candles)
+
             tag = f"D-{day_diff}"
 
-            # SELL liquidity (swing high)
-            if cur["high"] > prev["high"] and cur["high"] > nxt["high"]:
-                raw_sell.append(
+            # Prior Day High = BUY-SIDE liquidity (upside stops)
+            liquidity["BUY_SIDE"].append(
+                LiquidityLevel(
+                    price=float(high),
+                    type="BUY_SIDE",
+                    timestamp=datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc),
+                    day_tag=tag,
+                )
+            )
+
+            # Prior Day Low = SELL-SIDE liquidity (downside stops)
+            liquidity["SELL_SIDE"].append(
+                LiquidityLevel(
+                    price=float(low),
+                    type="SELL_SIDE",
+                    timestamp=datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc),
+                    day_tag=tag,
+                )
+            )
+
+        # -----------------------------
+        # 2️⃣ MULTI-TOUCH CLUSTERS
+        # -----------------------------
+        highs = []
+        lows = []
+
+        for candle in rates:
+            highs.append(candle["high"])
+            lows.append(candle["low"])
+
+        def cluster_levels(prices):
+            clusters = []
+
+            for p in prices:
+                found = False
+                for cluster in clusters:
+                    if abs(cluster[0] - p) <= self.CLUSTER_TOLERANCE:
+                        cluster.append(p)
+                        found = True
+                        break
+
+                if not found:
+                    clusters.append([p])
+
+            return clusters
+
+        high_clusters = cluster_levels(highs)
+        low_clusters = cluster_levels(lows)
+
+        for cluster in high_clusters:
+            if len(cluster) >= self.MIN_TOUCHES:
+                price = sum(cluster) / len(cluster)
+                liquidity["BUY_SIDE"].append(
                     LiquidityLevel(
-                        price=float(cur["high"]),
-                        type="SELL",
-                        timestamp=ts,
-                        day_tag=tag
+                        price=float(price),
+                        type="BUY_SIDE",
+                        timestamp=start,
+                        day_tag="CLUSTER",
                     )
                 )
 
-            # BUY liquidity (swing low)
-            if cur["low"] < prev["low"] and cur["low"] < nxt["low"]:
-                raw_buy.append(
+        for cluster in low_clusters:
+            if len(cluster) >= self.MIN_TOUCHES:
+                price = sum(cluster) / len(cluster)
+                liquidity["SELL_SIDE"].append(
                     LiquidityLevel(
-                        price=float(cur["low"]),
-                        type="BUY",
-                        timestamp=ts,
-                        day_tag=tag
+                        price=float(price),
+                        type="SELL_SIDE",
+                        timestamp=start,
+                        day_tag="CLUSTER",
                     )
                 )
 
         # -----------------------------
-        # MITIGATION CHECK
+        # 3️⃣ MITIGATION CHECK
         # -----------------------------
         for candle in rates:
             candle_time = datetime.fromtimestamp(candle["time"], tz=timezone.utc)
 
-            for lvl in raw_sell:
+            for lvl in liquidity["BUY_SIDE"]:
                 if not lvl.mitigated and candle_time > lvl.timestamp:
                     if candle["high"] >= lvl.price:
                         lvl.mitigated = True
 
-            for lvl in raw_buy:
+            for lvl in liquidity["SELL_SIDE"]:
                 if not lvl.mitigated and candle_time > lvl.timestamp:
                     if candle["low"] <= lvl.price:
                         lvl.mitigated = True
 
         # -----------------------------
-        # DEDUPE (KEEP MOST RECENT)
+        # 4️⃣ DEDUPE (KEEP MOST RECENT)
         # -----------------------------
         def dedupe(levels):
-            by_price = {}
+            by_bucket = {}
             for lvl in levels:
                 if lvl.mitigated:
                     continue
-                if lvl.price not in by_price or lvl.timestamp > by_price[lvl.price].timestamp:
-                    by_price[lvl.price] = lvl
-            return list(by_price.values())
+                key = round(lvl.price, 4)
+                if key not in by_bucket or lvl.timestamp > by_bucket[key].timestamp:
+                    by_bucket[key] = lvl
+            return list(by_bucket.values())
 
         return {
-            "SELL": dedupe(raw_sell),
-            "BUY": dedupe(raw_buy),
+            "BUY_SIDE": dedupe(liquidity["BUY_SIDE"]),
+            "SELL_SIDE": dedupe(liquidity["SELL_SIDE"]),
         }
